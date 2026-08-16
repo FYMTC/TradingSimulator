@@ -3,8 +3,21 @@
 //! The crate intentionally uses only the Rust standard library.  It provides a
 //! single-instrument, price-time-priority order book plus the minimum account
 //! state required to model cash reservation and A-share-style T+1 sellability.
+//!
+//! On top of the matching core, the M1 layer adds:
+//!
+//! - [`rng`]: a dependency-free deterministic generator (xoshiro256++),
+//! - [`bar`]: OHLCV bar aggregation from the executed trade tape,
+//! - [`stats`]: the estimators used by the stylized-facts acceptance harness,
+//! - [`sim`]: zero-intelligence noise agents driving the exchange through
+//!   Poisson wake-ups, with full event-log replay.
 
 #![forbid(unsafe_code)]
+
+pub mod bar;
+pub mod rng;
+pub mod sim;
+pub mod stats;
 
 use std::collections::{BTreeMap, HashMap};
 
