@@ -30,7 +30,10 @@ impl BarAggregator {
     /// Creates an aggregator whose bars each span `width_ms` of sim time.
     pub fn new(width_ms: SimTime) -> Self {
         assert!(width_ms > 0, "bar width must be positive");
-        Self { width_ms, current: None }
+        Self {
+            width_ms,
+            current: None,
+        }
     }
 
     /// Ingests one print; returns the bar that just closed, if any.

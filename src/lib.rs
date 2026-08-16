@@ -11,10 +11,14 @@
 //! - [`stats`]: the estimators used by the stylized-facts acceptance harness,
 //! - [`sim`]: zero-intelligence noise agents driving the exchange through
 //!   Poisson wake-ups, with full event-log replay.
+//! - [`rl`]: M2 Q-learning investors that observe the book, manage
+//!   inventory, and learn spread capture while trading against the noise
+//!   crowd, still fully deterministic and replayable.
 
 #![forbid(unsafe_code)]
 
 pub mod bar;
+pub mod rl;
 pub mod rng;
 pub mod sim;
 pub mod stats;
