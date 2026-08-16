@@ -16,21 +16,22 @@
 //! (wake-up rate, risk aversion, inventory target, order size), so the
 //! population behaves heterogeneously like a real investor crowd.
 //!
-//! Learning stays inside the deterministic simulation contract: one shared
-//! [`Rng`], strictly ordered events, and a canonical replay log, so a seed
-//! reproduces the entire market bit for bit, including everything the
-//! agents learned along the way.
-
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+//! Learning stays inside the deterministic simulation contract: the shared
+//! [`crate::engine`] core (one RNG, strictly ordered events, canonical
+//! replay log) means a seed reproduces the entire market bit for bit,
+//! including everything the agents learned along the way.
 
 use crate::bar::{Bar, TapePrint, aggregate_bars};
-use crate::rng::Rng;
+use crate::engine::{self, KIND_SETTLE, MarketCore, MarketDriver};
 use crate::sim::{NoiseAgentParams, QuoteView, noise_order_price, noise_order_quantity};
 use crate::{
-    Account, AccountId, Event, EventKey, EventKind, Exchange, LimitOrderRequest, Money, OrderId,
-    Price, Quantity, Side, SimTime,
+    AccountId, Event, Exchange, LimitOrderRequest, Money, OrderId, Price, Quantity, Side, SimTime,
 };
+
+/// Queue kind of a noise-agent wake-up within the M2 market.
+const KIND_NOISE: u8 = 1;
+/// Queue kind of an RL-agent decision within the M2 market.
+const KIND_RL: u8 = 2;
 
 /// Number of discrete market states: 3 spread-width x 3 inventory buckets.
 /// Kept deliberately small so ~10^2-10^3 decisions per agent suffice to
@@ -163,7 +164,7 @@ struct RlAgent {
     account_id: AccountId,
     q: QTable,
     epsilon: f64,
-    /// Personal wake-up intensity multiplier context, events per second.
+    /// Personal wake-up intensity, events per second.
     wake_rate_per_second: f64,
     /// Personal inventory-risk aversion.
     inventory_penalty: f64,
@@ -241,42 +242,14 @@ impl Default for RlMarketConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct QueueEntry {
-    time_ms: SimTime,
-    /// Global tie-breaker guaranteeing a total order over simultaneous
-    /// events; this is what makes the run deterministic.
-    seq: u64,
-    actor: Actor,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Actor {
-    Noise(usize),
-    Rl(usize),
-    Settle,
-}
-
 /// A mixed market: zero-intelligence noise agents supply background
 /// liquidity while Q-learning investors trade against them.
 #[derive(Clone, Debug)]
 pub struct RlMarket {
     config: RlMarketConfig,
-    exchange: Exchange,
-    rng: Rng,
-    queue: BinaryHeap<Reverse<QueueEntry>>,
-    next_seq: u64,
-    /// Event-log sequence, allocated at log time so one wake may emit
-    /// several uniquely keyed events (e.g. cancels + a submit).
-    next_event_seq: u64,
-    now_ms: SimTime,
-    last_trade_price: Option<Price>,
-    tape: Vec<TapePrint>,
-    spread_samples_ticks: Vec<i64>,
+    core: MarketCore,
     noise_resting: Vec<Vec<OrderId>>,
     rl_agents: Vec<RlAgent>,
-    replay_log: Vec<Event>,
-    rejected_submits: usize,
 }
 
 impl RlMarket {
@@ -286,28 +259,33 @@ impl RlMarket {
     pub fn new(config: RlMarketConfig) -> Self {
         assert!(config.n_noise_agents >= 2, "need at least two noise agents");
         assert!(config.n_rl_agents >= 1, "need at least one RL agent");
-        let mut exchange = Exchange::new(config.symbol.clone());
         let n_agents = config.n_noise_agents + config.n_rl_agents;
+        let mut core = MarketCore::new(
+            config.symbol.clone(),
+            config.ref_price,
+            config.day_length_ms,
+            config.seed,
+        );
         for agent in 0..n_agents {
-            let mut account = Account::with_cash(config.agent_cash);
-            account.seed_settled_position(&config.symbol, config.agent_seed_shares);
-            exchange
-                .add_account(agent as AccountId, account)
-                .expect("account ids are unique");
+            core.add_funded_account(
+                agent as AccountId,
+                config.agent_cash,
+                config.agent_seed_shares,
+            );
         }
 
         let seed_lots = config.agent_seed_shares / crate::sim::LOT_SIZE;
-        let mut rng = Rng::seed_from_u64(config.seed);
         let mut rl_agents = Vec::with_capacity(config.n_rl_agents);
         for index in 0..config.n_rl_agents {
             // Deterministic investor personalities: patience, risk
             // aversion, target inventory, and order size all vary.
-            let wake_rate = config.rl_wake_rate_per_second * (0.5 + rng.next_f64());
-            let inventory_penalty = config.rl.inventory_penalty_per_lot * (0.5 + rng.next_f64());
-            let max_lots = rng.uniform_int(1, config.rl.max_order_lots);
+            let wake_rate = config.rl_wake_rate_per_second * (0.5 + core.rng.next_f64());
+            let inventory_penalty =
+                config.rl.inventory_penalty_per_lot * (0.5 + core.rng.next_f64());
+            let max_lots = core.rng.uniform_int(1, config.rl.max_order_lots);
             // Inventory targets stay within a few orders of the endowment
             // so the position bucket reacts to real accumulation.
-            let target_lots = seed_lots + rng.uniform_int(-5, 5);
+            let target_lots = seed_lots + core.rng.uniform_int(-5, 5);
             let position_cap_lots = 5 * max_lots;
             rl_agents.push(RlAgent {
                 account_id: (config.n_noise_agents + index) as AccountId,
@@ -328,76 +306,69 @@ impl RlMarket {
 
         let mut market = Self {
             config,
-            exchange,
-            rng,
-            queue: BinaryHeap::new(),
-            next_seq: 0,
-            next_event_seq: 0,
-            now_ms: 0,
-            last_trade_price: None,
-            tape: Vec::new(),
-            spread_samples_ticks: Vec::new(),
+            core,
             noise_resting: vec![Vec::new(); n_agents],
             rl_agents,
-            replay_log: Vec::new(),
-            rejected_submits: 0,
         };
         for agent in 0..market.config.n_noise_agents {
             let gap = market
+                .core
                 .rng
                 .poisson_gap_ms(market.config.noise.wake_rate_per_second);
-            market.schedule(gap, Actor::Noise(agent));
+            market.core.schedule(gap, KIND_NOISE, agent);
         }
         let rl_gaps: Vec<SimTime> = market
             .rl_agents
             .iter()
-            .map(|agent| market.rng.poisson_gap_ms(agent.wake_rate_per_second))
+            .map(|agent| market.core.rng.poisson_gap_ms(agent.wake_rate_per_second))
             .collect();
         for (index, gap) in rl_gaps.into_iter().enumerate() {
-            market.schedule(gap, Actor::Rl(index));
+            market.core.schedule(gap, KIND_RL, index);
         }
-        market.schedule(market.config.day_length_ms, Actor::Settle);
+        market
+            .core
+            .schedule(market.config.day_length_ms, KIND_SETTLE, 0);
         market
     }
 
     /// The underlying exchange.
     pub fn exchange(&self) -> &Exchange {
-        &self.exchange
+        &self.core.exchange
     }
 
     /// Current simulation time in milliseconds.
     pub fn now_ms(&self) -> SimTime {
-        self.now_ms
+        self.core.now_ms()
     }
 
     /// The executed trade tape in order.
     pub fn tape(&self) -> &[TapePrint] {
-        &self.tape
+        self.core.tape()
     }
 
     /// Post-trade spread samples (in ticks) collected during the run.
     pub fn spread_samples_ticks(&self) -> &[i64] {
-        &self.spread_samples_ticks
+        self.core.spread_samples_ticks()
     }
 
     /// Aggregates the tape into OHLCV bars of `width_ms`.
     pub fn bars(&self, width_ms: SimTime) -> Vec<Bar> {
-        aggregate_bars(self.tape.iter().copied(), width_ms)
+        aggregate_bars(self.core.tape().iter().copied(), width_ms)
     }
 
     /// Submissions rejected by risk checks so far (diagnostics).
     pub fn rejected_submits(&self) -> usize {
-        self.rejected_submits
+        self.core.rejected_submits()
     }
 
     /// The recorded event log, replayable through [`Exchange::replay`].
     pub fn replay_log(&self) -> &[Event] {
-        &self.replay_log
+        self.core.replay_log()
     }
 
     /// Snapshot of every RL agent's learning state and wealth.
     pub fn rl_stats(&self) -> Vec<RlAgentStats> {
-        let mark = self.mark_price();
+        let mark = self.core.mark_price();
         self.rl_agents
             .iter()
             .map(|agent| RlAgentStats {
@@ -415,50 +386,7 @@ impl RlMarket {
 
     /// Processes every event scheduled at or before `target_ms`.
     pub fn run_until(&mut self, target_ms: SimTime) {
-        while let Some(Reverse(entry)) = self.queue.peek() {
-            if entry.time_ms > target_ms {
-                break;
-            }
-            let Reverse(entry) = self.queue.pop().expect("peeked entry exists");
-            self.now_ms = self.now_ms.max(entry.time_ms);
-            match entry.actor {
-                Actor::Settle => {
-                    self.exchange.settle_trading_day();
-                    self.log_event(entry.time_ms, EventKind::SettleTradingDay);
-                    let next = entry
-                        .time_ms
-                        .checked_add(self.config.day_length_ms)
-                        .expect("sim time overflow");
-                    self.schedule(next, Actor::Settle);
-                }
-                Actor::Noise(agent) => self.wake_noise(agent, entry.time_ms),
-                Actor::Rl(agent) => self.wake_rl_agent(agent, entry.time_ms),
-            }
-        }
-        self.now_ms = self.now_ms.max(target_ms);
-    }
-
-    fn schedule(&mut self, time_ms: SimTime, actor: Actor) {
-        let seq = self.next_seq;
-        self.next_seq = self.next_seq.checked_add(1).expect("sequence overflow");
-        self.queue.push(Reverse(QueueEntry {
-            time_ms,
-            seq,
-            actor,
-        }));
-    }
-
-    fn log_event(&mut self, time_ms: SimTime, kind: EventKind) {
-        let seq = self.next_event_seq;
-        self.next_event_seq = seq.checked_add(1).expect("event sequence overflow");
-        self.replay_log.push(Event {
-            key: EventKey {
-                sim_time: time_ms,
-                source_priority: 1,
-                source_seq: seq,
-            },
-            kind,
-        });
+        engine::run_until(self, target_ms);
     }
 
     // ------------------------------------------------------------------
@@ -468,22 +396,19 @@ impl RlMarket {
     fn wake_noise(&mut self, agent: usize, now_ms: SimTime) {
         // Drop ids that have since filled or been cancelled.
         let mut live = std::mem::take(&mut self.noise_resting[agent]);
-        live.retain(|id| self.exchange.book().order(*id).is_some());
+        live.retain(|id| self.core.exchange.book().order(*id).is_some());
 
-        let should_cancel =
-            !live.is_empty() && self.rng.bernoulli(self.config.noise.cancel_probability);
+        let should_cancel = !live.is_empty()
+            && self
+                .core
+                .rng
+                .bernoulli(self.config.noise.cancel_probability);
         if should_cancel {
-            let index = self.rng.uniform_int(0, live.len() as i64 - 1) as usize;
+            let index = self.core.rng.uniform_int(0, live.len() as i64 - 1) as usize;
             let order_id = live.swap_remove(index);
             self.noise_resting[agent] = live;
-            let _ = self.exchange.cancel_order(agent as AccountId, order_id);
-            self.log_event(
-                now_ms,
-                EventKind::Cancel {
-                    account_id: agent as AccountId,
-                    order_id,
-                },
-            );
+            self.core
+                .cancel_tracked(agent as AccountId, order_id, now_ms);
         } else {
             if let Some(order_id) = self.place_noise_order(agent, now_ms) {
                 live.push(order_id);
@@ -492,38 +417,48 @@ impl RlMarket {
         }
 
         let gap = self
+            .core
             .rng
             .poisson_gap_ms(self.config.noise.wake_rate_per_second);
         let next = now_ms.checked_add(gap).expect("sim time overflow");
-        self.schedule(next, Actor::Noise(agent));
+        self.core.schedule(next, KIND_NOISE, agent);
     }
 
     /// Places one noise order; returns the order id when any quantity rests.
     fn place_noise_order(&mut self, agent: usize, now_ms: SimTime) -> Option<OrderId> {
-        let side = if self.rng.bernoulli(0.5) {
+        let side = if self.core.rng.bernoulli(0.5) {
             Side::Buy
         } else {
             Side::Sell
         };
-        let aggressive = self.rng.bernoulli(self.config.noise.aggressive_probability);
+        let aggressive = self
+            .core
+            .rng
+            .bernoulli(self.config.noise.aggressive_probability);
         let view = QuoteView {
-            best_bid: self.exchange.book().best_bid(),
-            best_ask: self.exchange.book().best_ask(),
-            last_trade: self.last_trade_price,
+            best_bid: self.core.exchange.book().best_bid(),
+            best_ask: self.core.exchange.book().best_ask(),
+            last_trade: self.core.last_trade_price(),
             ref_price: self.config.ref_price,
         };
-        let price = noise_order_price(view, &mut self.rng, &self.config.noise, side, aggressive);
+        let price = noise_order_price(
+            view,
+            &mut self.core.rng,
+            &self.config.noise,
+            side,
+            aggressive,
+        );
         if price <= 0 {
             return None;
         }
-        let quantity = noise_order_quantity(&mut self.rng, &self.config.noise);
+        let quantity = noise_order_quantity(&mut self.core.rng, &self.config.noise);
         let request = LimitOrderRequest {
             account_id: agent as AccountId,
             side,
             limit_price: price,
             quantity,
         };
-        self.submit_and_track(request, now_ms)
+        self.core.submit_and_track(request, now_ms)
     }
 
     // ------------------------------------------------------------------
@@ -533,7 +468,7 @@ impl RlMarket {
     fn wake_rl_agent(&mut self, index: usize, now_ms: SimTime) {
         // 1. Observe the market and own account.
         let state = self.observe(index);
-        let mark = self.mark_price();
+        let mark = self.core.mark_price();
         let account_id = self.rl_agents[index].account_id;
         let pnl = self.agent_pnl(account_id, mark);
         let lots = self.agent_lots(account_id);
@@ -582,9 +517,9 @@ impl RlMarket {
 
         // 4. Sleep until the next decision.
         let rate = self.rl_agents[index].wake_rate_per_second;
-        let gap = self.rng.poisson_gap_ms(rate);
+        let gap = self.core.rng.poisson_gap_ms(rate);
         let next = now_ms.checked_add(gap).expect("sim time overflow");
-        self.schedule(next, Actor::Rl(index));
+        self.core.schedule(next, KIND_RL, index);
     }
 
     /// Discretises the market view plus own inventory into a state index:
@@ -592,8 +527,8 @@ impl RlMarket {
     /// the learnable structure of this market - quoting earns more when
     /// the spread is wide, and inventory wants managing around the target.
     fn observe(&self, index: usize) -> usize {
-        let bid = self.exchange.book().best_bid();
-        let ask = self.exchange.book().best_ask();
+        let bid = self.core.exchange.book().best_bid();
+        let ask = self.core.exchange.book().best_ask();
 
         // Spread width bucket in ticks.
         let spread_bucket: usize = match (bid, ask) {
@@ -623,8 +558,8 @@ impl RlMarket {
 
     fn select_rl_action(&mut self, index: usize, state: usize) -> usize {
         let agent = &self.rl_agents[index];
-        if self.rng.next_f64() < agent.epsilon {
-            self.rng.uniform_int(0, N_ACTIONS as i64 - 1) as usize
+        if self.core.rng.next_f64() < agent.epsilon {
+            self.core.rng.uniform_int(0, N_ACTIONS as i64 - 1) as usize
         } else {
             agent.q.best_action(state)
         }
@@ -634,16 +569,9 @@ impl RlMarket {
     fn cancel_rl_resting(&mut self, index: usize, now_ms: SimTime) {
         let account_id = self.rl_agents[index].account_id;
         let mut resting = std::mem::take(&mut self.rl_agents[index].resting);
-        resting.retain(|id| self.exchange.book().order(*id).is_some());
+        resting.retain(|id| self.core.exchange.book().order(*id).is_some());
         for order_id in resting.drain(..) {
-            let _ = self.exchange.cancel_order(account_id, order_id);
-            self.log_event(
-                now_ms,
-                EventKind::Cancel {
-                    account_id,
-                    order_id,
-                },
-            );
+            self.core.cancel_tracked(account_id, order_id, now_ms);
         }
     }
 
@@ -663,10 +591,14 @@ impl RlMarket {
                 agent.position_cap_lots,
             )
         };
-        let mark = self.last_trade_price.unwrap_or(self.config.ref_price);
-        let bid = self.exchange.book().best_bid();
-        let ask = self.exchange.book().best_ask();
+        let mark = self
+            .core
+            .last_trade_price()
+            .unwrap_or(self.config.ref_price);
+        let bid = self.core.exchange.book().best_bid();
+        let ask = self.core.exchange.book().best_ask();
         let sellable_lots = self
+            .core
             .exchange
             .account(account_id)
             .map(|account| account.position(&self.config.symbol).sellable / crate::sim::LOT_SIZE)
@@ -725,58 +657,19 @@ impl RlMarket {
             limit_price: price,
             quantity: lots * crate::sim::LOT_SIZE,
         };
-        if let Some(order_id) = self.submit_and_track(request, now_ms) {
+        if let Some(order_id) = self.core.submit_and_track(request, now_ms) {
             self.rl_agents[index].resting.push(order_id);
         }
     }
 
     // ------------------------------------------------------------------
-    // Shared plumbing.
+    // Account helpers.
     // ------------------------------------------------------------------
-
-    /// Logs, submits, and records tape/spread side effects; returns the
-    /// order id when any quantity rests.
-    fn submit_and_track(&mut self, request: LimitOrderRequest, now_ms: SimTime) -> Option<OrderId> {
-        self.log_event(now_ms, EventKind::Submit(request));
-        let Ok(result) = self.exchange.submit_limit_order(request) else {
-            self.rejected_submits += 1;
-            return None;
-        };
-        for trade in &result.trades {
-            self.last_trade_price = Some(trade.price);
-            self.tape
-                .push(TapePrint::new(now_ms, trade.price, trade.quantity));
-        }
-        if !result.trades.is_empty()
-            && let (Some(bid), Some(ask)) = (
-                self.exchange.book().best_bid(),
-                self.exchange.book().best_ask(),
-            )
-        {
-            self.spread_samples_ticks.push(ask - bid);
-        }
-        (result.remaining > 0).then_some(result.order_id)
-    }
-
-    /// Mark price for PnL accounting: the mid quote when both sides are
-    /// quoted, the available touch otherwise, falling back to the last
-    /// trade or the reference price on a cold book.  Marking at the mid
-    /// (rather than the last print) keeps an agent's own executions from
-    /// moving its mark: crossing the spread shows up as an immediate,
-    /// visible cost and filling passively as an immediate, visible gain.
-    fn mark_price(&self) -> Price {
-        let bid = self.exchange.book().best_bid();
-        let ask = self.exchange.book().best_ask();
-        match (bid, ask) {
-            (Some(bid), Some(ask)) => (bid + ask) / 2,
-            (Some(price), None) | (None, Some(price)) => price,
-            (None, None) => self.last_trade_price.unwrap_or(self.config.ref_price),
-        }
-    }
 
     /// Total shares held (settled + today's buys), in lots.
     fn agent_lots(&self, account_id: AccountId) -> i64 {
-        self.exchange
+        self.core
+            .exchange
             .account(account_id)
             .map(|account| {
                 let position = account.position(&self.config.symbol);
@@ -794,7 +687,7 @@ impl RlMarket {
     /// above the mark slightly overstates PnL, bounded by the spread: the
     /// exact cost structure the agents should learn to avoid.
     fn agent_pnl(&self, account_id: AccountId, mark: Price) -> Money {
-        match self.exchange.account(account_id) {
+        match self.core.exchange.account(account_id) {
             Some(account) => {
                 let position = account.position(&self.config.symbol);
                 let shares =
@@ -803,6 +696,20 @@ impl RlMarket {
                     + Money::from(shares) * Money::from(mark)
             }
             None => 0,
+        }
+    }
+}
+
+impl MarketDriver for RlMarket {
+    fn core(&mut self) -> &mut MarketCore {
+        &mut self.core
+    }
+
+    fn wake(&mut self, kind: u8, index: usize, now_ms: SimTime) {
+        match kind {
+            KIND_NOISE => self.wake_noise(index, now_ms),
+            KIND_RL => self.wake_rl_agent(index, now_ms),
+            other => unreachable!("unknown wake kind {other}"),
         }
     }
 }
@@ -817,6 +724,7 @@ fn money_to_reward(delta: Money) -> f64 {
 mod tests {
     use super::*;
     use crate::stats;
+    use crate::{Account, AccountId, Exchange};
 
     fn small_config(seed: u64) -> RlMarketConfig {
         RlMarketConfig {

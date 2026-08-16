@@ -14,10 +14,16 @@
 //! - [`rl`]: M2 Q-learning investors that observe the book, manage
 //!   inventory, and learn spread capture while trading against the noise
 //!   crowd, still fully deterministic and replayable.
+//! - [`hetero`]: M3 strategy diversity (market makers, trend, mean
+//!   reversion, fundamentalists) plus a Markov scenario engine that
+//!   modulates agent parameters across calm/bull/bear/crisis regimes and
+//!   a U-shaped intraday activity profile.
 
 #![forbid(unsafe_code)]
 
 pub mod bar;
+mod engine;
+pub mod hetero;
 pub mod rl;
 pub mod rng;
 pub mod sim;
