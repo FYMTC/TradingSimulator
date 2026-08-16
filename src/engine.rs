@@ -155,32 +155,51 @@ impl MarketCore {
         );
     }
 
-    /// Logs, submits, and records tape/spread side effects; returns the
-    /// order id when any quantity rests.
+    /// Logs, submits, and records tape/spread side effects, returning the
+    /// full submission outcome (fills included) so interactive callers -
+    /// the game layer's player orders - see everything the exchange did.
+    pub(crate) fn submit_verbose(
+        &mut self,
+        request: LimitOrderRequest,
+        now_ms: SimTime,
+    ) -> Result<crate::SubmitResult, crate::ExchangeError> {
+        self.log_event(now_ms, EventKind::Submit(request));
+        match self.exchange.submit_limit_order(request) {
+            Ok(result) => {
+                for trade in &result.trades {
+                    self.last_trade_price = Some(trade.price);
+                    self.tape
+                        .push(TapePrint::new(now_ms, trade.price, trade.quantity));
+                }
+                if !result.trades.is_empty()
+                    && let (Some(bid), Some(ask)) = (
+                        self.exchange.book().best_bid(),
+                        self.exchange.book().best_ask(),
+                    )
+                {
+                    self.spread_samples_ticks.push(ask - bid);
+                }
+                Ok(result)
+            }
+            Err(error) => {
+                self.rejected_submits += 1;
+                Err(error)
+            }
+        }
+    }
+
+    /// Like [`MarketCore::submit_verbose`] but returns only the resting
+    /// order id; agent populations use this because they track their own
+    /// orders and never react to rejection reasons.
     pub(crate) fn submit_and_track(
         &mut self,
         request: LimitOrderRequest,
         now_ms: SimTime,
     ) -> Option<OrderId> {
-        self.log_event(now_ms, EventKind::Submit(request));
-        let Ok(result) = self.exchange.submit_limit_order(request) else {
-            self.rejected_submits += 1;
-            return None;
-        };
-        for trade in &result.trades {
-            self.last_trade_price = Some(trade.price);
-            self.tape
-                .push(TapePrint::new(now_ms, trade.price, trade.quantity));
-        }
-        if !result.trades.is_empty()
-            && let (Some(bid), Some(ask)) = (
-                self.exchange.book().best_bid(),
-                self.exchange.book().best_ask(),
-            )
-        {
-            self.spread_samples_ticks.push(ask - bid);
-        }
-        (result.remaining > 0).then_some(result.order_id)
+        self.submit_verbose(request, now_ms)
+            .ok()
+            .filter(|result| result.remaining > 0)
+            .map(|result| result.order_id)
     }
 
     /// Mark price for PnL accounting: the mid quote when both sides are

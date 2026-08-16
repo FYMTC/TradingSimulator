@@ -365,6 +365,12 @@ impl HeteroMarket {
         &self.core.exchange
     }
 
+    /// Read-only view of the shared core, for wrapper layers (the game
+    /// market) that only need to observe.
+    pub(crate) fn core_view(&self) -> &MarketCore {
+        &self.core
+    }
+
     /// Current simulation time in milliseconds.
     pub fn now_ms(&self) -> SimTime {
         self.core.now_ms()

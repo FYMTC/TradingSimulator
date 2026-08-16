@@ -18,11 +18,15 @@
 //!   reversion, fundamentalists) plus a Markov scenario engine that
 //!   modulates agent parameters across calm/bull/bear/crisis regimes and
 //!   a U-shaped intraday activity profile.
+//! - [`game`]: M4 back end - the player's trading loop on top of the M3
+//!   market, A-share daily price limits, and a pump-and-dump manipulator,
+//!   all on the same virtual clock.
 
 #![forbid(unsafe_code)]
 
 pub mod bar;
 mod engine;
+pub mod game;
 pub mod hetero;
 pub mod rl;
 pub mod rng;
@@ -528,6 +532,13 @@ pub enum ExchangeError {
     UnknownAccount(AccountId),
     InvalidPrice(Price),
     InvalidQuantity(Quantity),
+    /// The limit price falls outside the daily price-limit band
+    /// (A-share style limit up/down).
+    PriceOutsideLimits {
+        price: Price,
+        lower: Price,
+        upper: Price,
+    },
     InsufficientCash {
         required: Money,
         available: Money,
@@ -544,6 +555,47 @@ pub enum ExchangeError {
     OrderIdOverflow,
     TradeIdOverflow,
     DuplicateEventKey(EventKey),
+}
+
+/// The daily price-limit band (A-share style limit up/down): orders may
+/// only quote inside `[lower, upper]`, which are the previous close
+/// scaled by `limit_bp` basis points (main board: 10% = 1000 bp).
+///
+/// Trading *at* the limit price is allowed - limit-locked sessions are
+/// simply a queue at the band edge, exactly like a real one-way market.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PriceLimits {
+    /// Previous close the band is computed from.
+    pub prev_close: Price,
+    /// Band width in basis points (10% = 1000).
+    pub limit_bp: i64,
+    pub upper: Price,
+    pub lower: Price,
+}
+
+impl PriceLimits {
+    fn new(prev_close: Price, limit_bp: i64) -> Self {
+        assert!(prev_close > 0, "previous close must be positive");
+        assert!(limit_bp > 0, "limit band must be positive");
+        let scale = |numerator: i128| -> Price {
+            // Round outward so the band is never narrower than nominal.
+            ((numerator + 9_999) / 10_000) as Price
+        };
+        let upper = (prev_close as i128 * (10_000 + limit_bp as i128)) / 10_000;
+        let lower = scale(prev_close as i128 * (10_000 - limit_bp as i128));
+        // Always leave at least one tradable tick inside the band, even
+        // for tiny prices where rounding would pin it shut.
+        Self {
+            prev_close,
+            limit_bp,
+            upper: (upper as Price).max(prev_close + 1),
+            lower: lower.min(prev_close - 1).max(1),
+        }
+    }
+
+    fn contains(&self, price: Price) -> bool {
+        (self.lower..=self.upper).contains(&price)
+    }
 }
 
 fn notional(price: Price, quantity: Quantity) -> Result<Money, ExchangeError> {
@@ -588,6 +640,8 @@ pub struct Exchange {
     trades: Vec<Trade>,
     next_order_id: OrderId,
     next_trade_id: TradeId,
+    /// A-share style daily price-limit band; `None` until configured.
+    price_limits: Option<PriceLimits>,
 }
 
 impl Exchange {
@@ -599,7 +653,20 @@ impl Exchange {
             trades: Vec::new(),
             next_order_id: 1,
             next_trade_id: 1,
+            price_limits: None,
         }
+    }
+
+    /// Enables the daily price-limit band around `prev_close`.
+    ///
+    /// Replays must configure the same initial band (like the same
+    /// accounts) before feeding the event log.
+    pub fn set_price_limits(&mut self, prev_close: Price, limit_bp: i64) {
+        self.price_limits = Some(PriceLimits::new(prev_close, limit_bp));
+    }
+
+    pub fn price_limits(&self) -> Option<&PriceLimits> {
+        self.price_limits.as_ref()
     }
 
     pub fn symbol(&self) -> &str {
@@ -635,6 +702,15 @@ impl Exchange {
         request: LimitOrderRequest,
     ) -> Result<SubmitResult, ExchangeError> {
         notional(request.limit_price, request.quantity)?;
+        if let Some(limits) = &self.price_limits
+            && !limits.contains(request.limit_price)
+        {
+            return Err(ExchangeError::PriceOutsideLimits {
+                price: request.limit_price,
+                lower: limits.lower,
+                upper: limits.upper,
+            });
+        }
         let order_id = self.next_order_id;
         let next_order_id = self
             .next_order_id
@@ -772,8 +848,20 @@ impl Exchange {
         })
     }
 
-    /// Performs the T+1 settlement boundary for the exchange's instrument.
+    /// Performs the T+1 settlement boundary for the exchange's
+    /// instrument.  With price limits enabled, the next session's band
+    /// re-centres on this session's close (the last trade price); a
+    /// session without trades keeps the previous band.
     pub fn settle_trading_day(&mut self) {
+        if let Some(last_close) = self.trades.last().map(|trade| trade.price) {
+            let bp = self
+                .price_limits
+                .as_ref()
+                .map_or(0, |limits| limits.limit_bp);
+            if bp > 0 {
+                self.price_limits = Some(PriceLimits::new(last_close, bp));
+            }
+        }
         for account in self.accounts.values_mut() {
             account.settle_trading_day(&self.symbol);
         }
@@ -1132,5 +1220,69 @@ mod tests {
             ])
             .unwrap_err();
         assert_eq!(error, ExchangeError::DuplicateEventKey(key));
+    }
+
+    #[test]
+    fn price_limits_reject_out_of_band_quotes_and_admit_band_edges() {
+        let mut exchange = funded_exchange();
+        exchange.set_price_limits(1_000, 1_000); // +/-10% -> [900, 1100]
+        assert_eq!(exchange.price_limits().unwrap().lower, 900);
+        assert_eq!(exchange.price_limits().unwrap().upper, 1_100);
+
+        // One tick beyond either edge is rejected, without consuming an
+        // order id or touching funds.
+        for (side, price) in [(Side::Buy, 1_101), (Side::Buy, 899), (Side::Sell, 1_101)] {
+            assert_eq!(
+                exchange.submit_limit_order(order(3, side, price, 1)),
+                Err(ExchangeError::PriceOutsideLimits {
+                    price,
+                    lower: 900,
+                    upper: 1_100,
+                })
+            );
+        }
+        assert_eq!(exchange.account(3).unwrap().cash_reserved, 0);
+
+        // Quoting exactly at limit up/down is allowed (limit-locked
+        // sessions are an orderly queue at the edge, not a halt).
+        let limit_up = exchange
+            .submit_limit_order(order(3, Side::Buy, 1_100, 1))
+            .unwrap();
+        assert!(limit_up.remaining > 0);
+        // The limit-down sell crosses the resting limit-up buy and fills
+        // there - quoting at the edge is legal and tradable.
+        let limit_down = exchange
+            .submit_limit_order(order(1, Side::Sell, 900, 1))
+            .unwrap();
+        assert_eq!(limit_down.trades.len(), 1);
+        assert_eq!(limit_down.trades[0].price, 1_100);
+    }
+
+    #[test]
+    fn settlement_rolls_the_band_onto_the_session_close() {
+        let mut exchange = funded_exchange();
+        exchange.set_price_limits(1_000, 1_000);
+        exchange
+            .submit_limit_order(order(1, Side::Sell, 1_050, 10))
+            .unwrap();
+        exchange
+            .submit_limit_order(order(4, Side::Buy, 1_050, 10))
+            .unwrap();
+
+        exchange.settle_trading_day();
+        // 1050 * 1.1 = 1155, 1050 * 0.9 = 945.
+        let limits = exchange.price_limits().unwrap();
+        assert_eq!(limits.prev_close, 1_050);
+        assert_eq!(limits.upper, 1_155);
+        assert_eq!(limits.lower, 945);
+        // The new band actually gates the next session's quotes.
+        assert_eq!(
+            exchange.submit_limit_order(order(3, Side::Buy, 1_156, 1)),
+            Err(ExchangeError::PriceOutsideLimits {
+                price: 1_156,
+                lower: 945,
+                upper: 1_155,
+            })
+        );
     }
 }
