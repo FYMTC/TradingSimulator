@@ -2,11 +2,21 @@
 use trading_simulator::sim::{NoiseAgentParams, NoiseMarket, NoiseMarketConfig};
 use trading_simulator::stats;
 
-fn probe(name: &str, n_agents: usize, overshoot: i64, aggr: f64, cancel: f64, sigma: f64) {
+#[allow(clippy::too_many_arguments)]
+fn probe(
+    name: &str,
+    n_agents: usize,
+    overshoot: i64,
+    behind: i64,
+    aggr: f64,
+    cancel: f64,
+    sigma: f64,
+) {
     let mut market = NoiseMarket::new(NoiseMarketConfig {
         n_agents,
         params: NoiseAgentParams {
             aggressive_overshoot_max_ticks: overshoot,
+            passive_max_quote_offset_ticks: behind,
             aggressive_probability: aggr,
             cancel_probability: cancel,
             size_sigma: sigma,
@@ -20,6 +30,7 @@ fn probe(name: &str, n_agents: usize, overshoot: i64, aggr: f64, cancel: f64, si
     let closes: Vec<f64> = bars.iter().map(|b| b.close as f64).collect();
     let returns = stats::log_returns(&closes);
     let acf1 = stats::autocorrelation(&returns, 1);
+    let acf5 = stats::autocorrelation(&returns, 5);
     let vr = stats::variance_ratio(&returns, 10);
     let kur = stats::excess_kurtosis(&returns);
     let spreads = market.spread_samples_ticks();
@@ -29,21 +40,32 @@ fn probe(name: &str, n_agents: usize, overshoot: i64, aggr: f64, cancel: f64, si
     let p95 = s[(s.len() as f64 * 0.95) as usize];
     let vols: Vec<f64> = bars.iter().map(|b| b.volume as f64).collect();
     let cv = stats::std_dev(&vols) / stats::mean(&vols);
+    let sorted_vols = {
+        let mut v = vols.clone();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v
+    };
+    let med_vol = sorted_vols[sorted_vols.len() / 2];
+    let max_vol = sorted_vols[sorted_vols.len() - 1];
     let prints: Vec<f64> = market.tape().iter().map(|p| p.quantity as f64).collect();
     let print_cv = stats::std_dev(&prints) / stats::mean(&prints);
+    let lo = bars.iter().map(|b| b.low).min().unwrap();
+    let hi = bars.iter().map(|b| b.high).max().unwrap();
     eprintln!(
-        "{name:22} acf1={acf1:+.3} vr={vr:.2} kur={kur:+6.1} med={med} p95={p95:2} bcv={cv:.2} pcv={print_cv:.2} rej={} prints={}",
-        market.rejected_submits(),
+        "{name:24} acf1={acf1:+.3} acf5={acf5:+.3} vr={vr:.2} kur={kur:+6.1} med={med} p95={p95:2} bcv={cv:.2} max/med={:.1} pcv={print_cv:.2} lo/hi={lo}/{hi} prints={}",
+        max_vol / med_vol,
         market.tape().len()
     );
 }
 
 #[test]
+#[ignore = "parameter tuning probe; run explicitly with: cargo test --release --test tune -- --ignored --nocapture"]
 fn tune() {
-    probe("A o2 a30 c35 s1.0", 192, 2, 0.30, 0.35, 1.0);
-    probe("B o2 a20 c35 s1.0", 192, 2, 0.20, 0.35, 1.0);
-    probe("C o5 a20 c35 s1.0", 192, 5, 0.20, 0.35, 1.0);
-    probe("D o5 a20 c50 s1.0", 192, 5, 0.20, 0.50, 1.0);
-    probe("E o5 a15 c35 s1.4", 192, 5, 0.15, 0.35, 1.4);
-    probe("F 256 o5 a20 c35", 256, 5, 0.20, 0.35, 1.0);
+    // The accepted calibration and its nearest neighbours, kept as the
+    // record of how tests/stylized_facts.rs parameters were chosen.
+    probe("ACCEPTED n64 c45 s2.4", 64, 5, 1, 0.30, 0.45, 2.4);
+    probe("n96 c45 s2.4", 96, 5, 1, 0.30, 0.45, 2.4);
+    probe("n192 c45 s2.4", 192, 5, 1, 0.30, 0.45, 2.4);
+    probe("n64 c35 s2.4", 64, 5, 1, 0.30, 0.35, 2.4);
+    probe("n64 c50 s2.4", 64, 5, 1, 0.30, 0.50, 2.4);
 }

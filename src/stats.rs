@@ -76,7 +76,10 @@ pub fn log_returns(prices: &[f64]) -> Vec<f64> {
 pub fn variance_ratio(returns: &[f64], k: usize) -> f64 {
     assert!(k >= 2, "variance ratio needs k >= 2");
     let base = variance(returns);
-    assert!(base > 0.0, "variance ratio of a constant series is undefined");
+    assert!(
+        base > 0.0,
+        "variance ratio of a constant series is undefined"
+    );
     let aggregated: Vec<f64> = returns
         .chunks(k)
         .filter(|chunk| chunk.len() == k)

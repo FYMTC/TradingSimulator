@@ -10,21 +10,24 @@
 //! The market parameters and the seed are fixed, so every assertion is
 //! reproducible bit for bit.  Diagnostics print with `--nocapture`.
 
-use trading_simulator::sim::{NoiseMarket, NoiseMarketConfig, NoiseAgentParams};
+use trading_simulator::sim::{NoiseAgentParams, NoiseMarket, NoiseMarketConfig};
 use trading_simulator::stats;
 
-/// 192 agents waking ~once per second for 40 simulated minutes.
+/// 64 agents waking ~once per second for 40 simulated minutes.
 fn acceptance_config(seed: u64) -> NoiseMarketConfig {
     NoiseMarketConfig {
         ref_price: 1_000,
-        n_agents: 192,
+        n_agents: 64,
         day_length_ms: 1_200_000,
         params: NoiseAgentParams {
             wake_rate_per_second: 1.0,
-            cancel_probability: 0.35,
+            cancel_probability: 0.45,
             aggressive_probability: 0.30,
             size_median_lots: 1.0,
-            size_sigma: 1.0,
+            size_sigma: 2.4,
+            aggressive_overshoot_max_ticks: 5,
+            passive_max_quote_offset_ticks: 1,
+            max_order_lots: 500,
         },
         seed,
         ..NoiseMarketConfig::default()
@@ -42,7 +45,11 @@ fn zero_intelligence_market_reproduces_stylized_facts() {
     market.run_until(2_400_000);
 
     let tape = market.tape();
-    assert!(tape.len() > 30_000, "market was too quiet: {} prints", tape.len());
+    assert!(
+        tape.len() > 30_000,
+        "market was too quiet: {} prints",
+        tape.len()
+    );
 
     // --- Spreads: positive, tight, with a bounded tail -------------------
     let spreads = market.spread_samples_ticks();
@@ -114,12 +121,13 @@ fn zero_intelligence_market_reproduces_stylized_facts() {
     eprintln!("prints: {}", tape.len());
     eprintln!("bars(1s): {}", bars.len());
     eprintln!("spread median/p95: {median_spread}/{p95_spread} ticks");
-    eprintln!(
-        "return acf(1)/acf(5): {acf1:.4}/{acf5:.4}, VR(10): {vr10:.3}"
-    );
+    eprintln!("return acf(1)/acf(5): {acf1:.4}/{acf5:.4}, VR(10): {vr10:.3}");
     eprintln!(
         "excess kurtosis(1s): {:.2}",
         stats::excess_kurtosis(&returns)
     );
-    eprintln!("volume CV: {cv:.2}, max/median: {:.1}", max_volume / median_volume);
+    eprintln!(
+        "volume CV: {cv:.2}, max/median: {:.1}",
+        max_volume / median_volume
+    );
 }

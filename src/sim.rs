@@ -14,10 +14,10 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-use crate::bar::{aggregate_bars, Bar, TapePrint};
+use crate::bar::{Bar, TapePrint, aggregate_bars};
 use crate::rng::Rng;
 use crate::{
-    Account, AccountId, Event, EventKind, EventKey, Exchange, LimitOrderRequest, Money, OrderId,
+    Account, AccountId, Event, EventKey, EventKind, Exchange, LimitOrderRequest, Money, OrderId,
     Price, Quantity, Side, SimTime,
 };
 
@@ -41,17 +41,31 @@ pub struct NoiseAgentParams {
     pub size_sigma: f64,
     /// Maximum extra ticks an aggressive order crosses beyond the touch.
     pub aggressive_overshoot_max_ticks: i64,
+    /// Maximum ticks a passive quote may step back from the same-side
+    /// touch; quotes always range from that far behind up to two ticks
+    /// inside the spread.
+    pub passive_max_quote_offset_ticks: i64,
+    /// Hard cap on noise order size in lots.  The lognormal draw is
+    /// unbounded; without a cap a monster order eventually exceeds the
+    /// seller's remaining position and trips the risk check.
+    pub max_order_lots: i64,
 }
 
 impl Default for NoiseAgentParams {
     fn default() -> Self {
+        // Calibrated against the M1 stylized-facts acceptance harness
+        // (tests/stylized_facts.rs): heavy-tailed sizes plus a thin,
+        // fast-cancelling book are what make the mid actually diffuse
+        // instead of bouncing between the touches.
         Self {
             wake_rate_per_second: 1.0,
-            cancel_probability: 0.35,
+            cancel_probability: 0.45,
             aggressive_probability: 0.30,
             size_median_lots: 1.0,
-            size_sigma: 1.0,
-            aggressive_overshoot_max_ticks: 2,
+            size_sigma: 2.4,
+            aggressive_overshoot_max_ticks: 5,
+            passive_max_quote_offset_ticks: 1,
+            max_order_lots: 500,
         }
     }
 }
@@ -105,6 +119,80 @@ struct QueueEntry {
 
 const SETTLE_SENTINEL: usize = usize::MAX;
 
+/// The market view a noise agent prices against.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QuoteView {
+    pub best_bid: Option<Price>,
+    pub best_ask: Option<Price>,
+    pub last_trade: Option<Price>,
+    pub ref_price: Price,
+}
+
+/// Touch-anchored pricing in the spirit of Farmer et al.: aggressive orders
+/// cross the touch by a random amount, passive orders improve, join, or
+/// step back from the same-side best quote.  Shared by the M1 noise market
+/// and the M2 mixed market.
+pub(crate) fn noise_order_price(
+    view: QuoteView,
+    rng: &mut Rng,
+    params: &NoiseAgentParams,
+    side: Side,
+    aggressive: bool,
+) -> Price {
+    let QuoteView {
+        best_bid,
+        best_ask,
+        last_trade,
+        ref_price,
+    } = view;
+    let (same_best, opposite_best) = match side {
+        Side::Buy => (best_bid, best_ask),
+        Side::Sell => (best_ask, best_bid),
+    };
+
+    if aggressive && let Some(opposite) = opposite_best {
+        let overshoot = rng.uniform_int(0, params.aggressive_overshoot_max_ticks);
+        return match side {
+            Side::Buy => opposite + overshoot,
+            Side::Sell => (opposite - overshoot).max(1),
+        };
+    }
+
+    // Passive: the offset shifts the quote by -behind..+2 ticks from the
+    // same-side best; negative steps behind the touch, positive improves
+    // inside the spread (never crossing the opposite touch).
+    if let Some(best) = same_best {
+        let offset = rng.uniform_int(-params.passive_max_quote_offset_ticks, 2);
+        let raw = match side {
+            Side::Buy => best + offset,
+            Side::Sell => best - offset,
+        };
+        // A passive order never crosses the opposite touch.
+        return match (side, opposite_best) {
+            (Side::Buy, Some(ask)) => raw.min(ask - 1).max(1),
+            (Side::Sell, Some(bid)) => raw.max(bid + 1),
+            _ => raw.max(1),
+        };
+    }
+
+    // Own side is empty: quote near the last trade (or the initial
+    // reference price on a cold start).
+    let anchor = last_trade.unwrap_or(ref_price);
+    let offset = rng.uniform_int(0, 2);
+    match side {
+        Side::Buy => (anchor - offset).max(1),
+        Side::Sell => anchor + offset,
+    }
+}
+
+/// Lognormal lot size, floored at one lot and capped at the configured
+/// maximum.
+pub(crate) fn noise_order_quantity(rng: &mut Rng, params: &NoiseAgentParams) -> Quantity {
+    let z = rng.standard_normal();
+    let lots = (z * params.size_sigma).exp() * params.size_median_lots;
+    (lots.max(1.0).round() as i64).clamp(1, params.max_order_lots) as Quantity * LOT_SIZE
+}
+
 /// A zero-intelligence market driven by Poisson-woken noise agents.
 #[derive(Clone, Debug)]
 pub struct NoiseMarket {
@@ -130,7 +218,6 @@ impl NoiseMarket {
     pub fn new(config: NoiseMarketConfig) -> Self {
         assert!(config.n_agents >= 2, "need at least two agents");
         let n_agents = config.n_agents;
-        let initial_ref = config.ref_price;
         let mut exchange = Exchange::new(config.symbol.clone());
         for agent in 0..n_agents {
             let mut account = Account::with_cash(config.agent_cash);
@@ -156,7 +243,9 @@ impl NoiseMarket {
             rejected_submits: 0,
         };
         for agent in 0..market.config.n_agents {
-            let gap = market.rng.poisson_gap_ms(market.config.params.wake_rate_per_second);
+            let gap = market
+                .rng
+                .poisson_gap_ms(market.config.params.wake_rate_per_second);
             market.schedule(gap, agent);
         }
         market.schedule(market.config.day_length_ms, SETTLE_SENTINEL);
@@ -226,7 +315,11 @@ impl NoiseMarket {
     fn schedule(&mut self, time_ms: SimTime, agent: usize) {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.checked_add(1).expect("sequence overflow");
-        self.queue.push(Reverse(QueueEntry { time_ms, seq, agent }));
+        self.queue.push(Reverse(QueueEntry {
+            time_ms,
+            seq,
+            agent,
+        }));
     }
 
     fn log_event(&mut self, time_ms: SimTime, seq: u64, kind: EventKind) {
@@ -245,10 +338,8 @@ impl NoiseMarket {
         let mut live = std::mem::take(&mut self.agents[agent].resting);
         live.retain(|id| self.exchange.book().order(*id).is_some());
 
-        let should_cancel = !live.is_empty()
-            && self
-                .rng
-                .bernoulli(self.config.params.cancel_probability);
+        let should_cancel =
+            !live.is_empty() && self.rng.bernoulli(self.config.params.cancel_probability);
         if should_cancel {
             let index = self.rng.uniform_int(0, live.len() as i64 - 1) as usize;
             let order_id = live.swap_remove(index);
@@ -272,10 +363,7 @@ impl NoiseMarket {
         let gap = self
             .rng
             .poisson_gap_ms(self.config.params.wake_rate_per_second);
-        self.schedule(
-            now_ms.checked_add(gap).expect("sim time overflow"),
-            agent,
-        );
+        self.schedule(now_ms.checked_add(gap).expect("sim time overflow"), agent);
     }
 
     /// Places one order; returns the order id when any quantity rests.
@@ -307,81 +395,34 @@ impl NoiseMarket {
         };
         for trade in &result.trades {
             self.last_trade_price = Some(trade.price);
-            self.tape.push(TapePrint::new(now_ms, trade.price, trade.quantity));
+            self.tape
+                .push(TapePrint::new(now_ms, trade.price, trade.quantity));
         }
-        if !result.trades.is_empty() {
-            if let (Some(bid), Some(ask)) =
-                (self.exchange.book().best_bid(), self.exchange.book().best_ask())
-            {
-                self.spread_samples_ticks.push(ask - bid);
-            }
+        if !result.trades.is_empty()
+            && let (Some(bid), Some(ask)) = (
+                self.exchange.book().best_bid(),
+                self.exchange.book().best_ask(),
+            )
+        {
+            self.spread_samples_ticks.push(ask - bid);
         }
         (result.remaining > 0).then_some(result.order_id)
     }
 
-    /// Touch-anchored pricing in the spirit of Farmer et al.: aggressive
-    /// orders cross the touch by a small random amount, passive orders
-    /// improve, join, or step back from the same-side best quote.  Prints
-    /// therefore cluster on one or two price levels around the touch, the
-    /// way they do in real limit order markets.
+    /// Touch-anchored pricing; see [`noise_order_price`].
     fn draw_price(&mut self, side: Side, aggressive: bool) -> Price {
-        let (same_best, opposite_best) = match side {
-            Side::Buy => (
-                self.exchange.book().best_bid(),
-                self.exchange.book().best_ask(),
-            ),
-            Side::Sell => (
-                self.exchange.book().best_ask(),
-                self.exchange.book().best_bid(),
-            ),
+        let view = QuoteView {
+            best_bid: self.exchange.book().best_bid(),
+            best_ask: self.exchange.book().best_ask(),
+            last_trade: self.last_trade_price,
+            ref_price: self.config.ref_price,
         };
-
-        if aggressive {
-            if let Some(opposite) = opposite_best {
-                let overshoot = self
-                    .rng
-                    .uniform_int(0, self.config.params.aggressive_overshoot_max_ticks);
-                return match side {
-                    Side::Buy => opposite + overshoot,
-                    Side::Sell => (opposite - overshoot).max(1),
-                };
-            }
-        }
-
-        // Passive: the offset shifts the quote by -1..+2 ticks from the
-        // same-side best; negative steps behind the touch, positive
-        // improves inside the spread (never crossing the opposite touch).
-        if let Some(best) = same_best {
-            let offset = self.rng.uniform_int(-1, 2);
-            let raw = match side {
-                Side::Buy => best + offset,
-                Side::Sell => best - offset,
-            };
-            // A passive order never crosses the opposite touch.
-            return match (side, opposite_best) {
-                (Side::Buy, Some(ask)) => raw.min(ask - 1).max(1),
-                (Side::Sell, Some(bid)) => raw.max(bid + 1),
-                _ => raw.max(1),
-            };
-        }
-
-        // Own side is empty: quote near the last trade (or the initial
-        // reference price on a cold start).
-        let anchor = self
-            .last_trade_price
-            .unwrap_or(self.config.ref_price);
-        let offset = self.rng.uniform_int(0, 2);
-        match side {
-            Side::Buy => (anchor - offset).max(1),
-            Side::Sell => anchor + offset,
-        }
+        noise_order_price(view, &mut self.rng, &self.config.params, side, aggressive)
     }
 
-    /// Lognormal lot size, floored at one lot.
+    /// Lognormal lot size; see [`noise_order_quantity`].
     fn draw_quantity(&mut self) -> Quantity {
-        let z = self.rng.standard_normal();
-        let lots = (z * self.config.params.size_sigma).exp() * self.config.params.size_median_lots;
-        (lots.max(1.0).round() as Quantity) * LOT_SIZE
+        noise_order_quantity(&mut self.rng, &self.config.params)
     }
 }
 
@@ -427,9 +468,7 @@ mod tests {
         for agent in 0..market.config.n_agents {
             let mut account = Account::with_cash(market.config.agent_cash);
             account.seed_settled_position(&market.config.symbol, market.config.agent_seed_shares);
-            rebuilt
-                .add_account(agent as AccountId, account)
-                .unwrap();
+            rebuilt.add_account(agent as AccountId, account).unwrap();
         }
         let processed = rebuilt
             .replay(market.replay_log().to_vec())
