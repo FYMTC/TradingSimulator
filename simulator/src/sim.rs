@@ -7,22 +7,22 @@
 //! random order flow with the book, which is exactly the claim of the Farmer
 //! et al. zero-intelligence line of research that M1 sets out to verify.
 //!
-//! Everything runs on a single thread with one shared [`Rng`], so a seed
-//! reproduces the market exactly.  The run is also recorded as a canonical
-//! [`Event`] log that replays to the identical exchange state.
-
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+//! Everything runs on the shared deterministic [`crate::engine`] core, so a
+//! seed reproduces the market exactly.  The run is also recorded as a
+//! canonical [`Event`] log that replays to the identical exchange state.
 
 use crate::bar::{Bar, TapePrint, aggregate_bars};
+use crate::engine::{self, KIND_SETTLE, MarketCore, MarketDriver};
 use crate::rng::Rng;
 use crate::{
-    Account, AccountId, Event, EventKey, EventKind, Exchange, LimitOrderRequest, Money, OrderId,
-    Price, Quantity, Side, SimTime,
+    AccountId, Exchange, LimitOrderRequest, Money, OrderId, Price, Quantity, Side, SimTime,
 };
 
 /// Shares per lot; quantities are placed in whole lots, A-share style.
 pub const LOT_SIZE: Quantity = 100;
+
+/// Queue kind of a noise-agent wake-up within the M1 market.
+const KIND_NOISE: u8 = 1;
 
 /// Behaviour parameters shared by every noise agent.
 #[derive(Clone, Copy, Debug)]
@@ -107,18 +107,6 @@ struct AgentState {
     resting: Vec<OrderId>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct QueueEntry {
-    time_ms: SimTime,
-    /// Global tie-breaker guaranteeing a total order over simultaneous
-    /// events; this is what makes the run deterministic.
-    seq: u64,
-    /// Agent index, or `SETTLE_SENTINEL` for the T+1 day boundary.
-    agent: usize,
-}
-
-const SETTLE_SENTINEL: usize = usize::MAX;
-
 /// The market view a noise agent prices against.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct QuoteView {
@@ -130,8 +118,8 @@ pub(crate) struct QuoteView {
 
 /// Touch-anchored pricing in the spirit of Farmer et al.: aggressive orders
 /// cross the touch by a random amount, passive orders improve, join, or
-/// step back from the same-side best quote.  Shared by the M1 noise market
-/// and the M2 mixed market.
+/// step back from the same-side best quote.  Shared by every market layer
+/// that keeps a zero-intelligence crowd for background liquidity.
 pub(crate) fn noise_order_price(
     view: QuoteView,
     rng: &mut Rng,
@@ -197,19 +185,8 @@ pub(crate) fn noise_order_quantity(rng: &mut Rng, params: &NoiseAgentParams) -> 
 #[derive(Clone, Debug)]
 pub struct NoiseMarket {
     config: NoiseMarketConfig,
-    exchange: Exchange,
-    rng: Rng,
-    queue: BinaryHeap<Reverse<QueueEntry>>,
-    next_seq: u64,
-    now_ms: SimTime,
-    last_trade_price: Option<Price>,
-    tape: Vec<TapePrint>,
-    /// Post-trade spread samples in ticks, for the acceptance harness.
-    spread_samples_ticks: Vec<i64>,
+    core: MarketCore,
     agents: Vec<AgentState>,
-    /// Canonical event log; replaying it rebuilds the identical exchange.
-    replay_log: Vec<Event>,
-    rejected_submits: usize,
 }
 
 impl NoiseMarket {
@@ -218,162 +195,118 @@ impl NoiseMarket {
     pub fn new(config: NoiseMarketConfig) -> Self {
         assert!(config.n_agents >= 2, "need at least two agents");
         let n_agents = config.n_agents;
-        let mut exchange = Exchange::new(config.symbol.clone());
+        let mut core = MarketCore::new(
+            config.symbol.clone(),
+            config.ref_price,
+            config.day_length_ms,
+            config.seed,
+        );
         for agent in 0..n_agents {
-            let mut account = Account::with_cash(config.agent_cash);
-            account.seed_settled_position(&config.symbol, config.agent_seed_shares);
-            exchange
-                .add_account(agent as AccountId, account)
-                .expect("account ids are unique");
+            core.add_funded_account(
+                agent as AccountId,
+                config.agent_cash,
+                config.agent_seed_shares,
+            );
         }
 
-        let rng = Rng::seed_from_u64(config.seed);
         let mut market = Self {
             config,
-            exchange,
-            rng,
-            queue: BinaryHeap::new(),
-            next_seq: 0,
-            now_ms: 0,
-            last_trade_price: None,
-            tape: Vec::new(),
-            spread_samples_ticks: Vec::new(),
+            core,
             agents: vec![AgentState::default(); n_agents],
-            replay_log: Vec::new(),
-            rejected_submits: 0,
         };
         for agent in 0..market.config.n_agents {
             let gap = market
+                .core
                 .rng
                 .poisson_gap_ms(market.config.params.wake_rate_per_second);
-            market.schedule(gap, agent);
+            market.core.schedule(gap, KIND_NOISE, agent);
         }
-        market.schedule(market.config.day_length_ms, SETTLE_SENTINEL);
+        market
+            .core
+            .schedule(market.config.day_length_ms, KIND_SETTLE, 0);
         market
     }
 
     /// The underlying exchange.
     pub fn exchange(&self) -> &Exchange {
-        &self.exchange
+        &self.core.exchange
     }
 
     /// Current simulation time in milliseconds.
     pub fn now_ms(&self) -> SimTime {
-        self.now_ms
+        self.core.now_ms()
     }
 
     /// The executed trade tape in order.
     pub fn tape(&self) -> &[TapePrint] {
-        &self.tape
+        self.core.tape()
     }
 
     /// Post-trade spread samples (in ticks) collected during the run.
     pub fn spread_samples_ticks(&self) -> &[i64] {
-        &self.spread_samples_ticks
+        self.core.spread_samples_ticks()
     }
 
     /// Aggregates the tape into OHLCV bars of `width_ms`.
     pub fn bars(&self, width_ms: SimTime) -> Vec<Bar> {
-        aggregate_bars(self.tape.iter().copied(), width_ms)
+        aggregate_bars(self.core.tape().iter().copied(), width_ms)
     }
 
     /// Submissions rejected by risk checks so far (diagnostics).
     pub fn rejected_submits(&self) -> usize {
-        self.rejected_submits
+        self.core.rejected_submits()
     }
 
     /// The recorded event log, replayable through [`Exchange::replay`].
-    pub fn replay_log(&self) -> &[Event] {
-        &self.replay_log
+    pub fn replay_log(&self) -> &[crate::Event] {
+        self.core.replay_log()
     }
 
     /// Processes every event scheduled at or before `target_ms`.
     pub fn run_until(&mut self, target_ms: SimTime) {
-        while let Some(Reverse(entry)) = self.queue.peek() {
-            if entry.time_ms > target_ms {
-                break;
-            }
-            let Reverse(entry) = self.queue.pop().expect("peeked entry exists");
-            self.now_ms = self.now_ms.max(entry.time_ms);
-            if entry.agent == SETTLE_SENTINEL {
-                self.exchange.settle_trading_day();
-                self.log_event(entry.time_ms, entry.seq, EventKind::SettleTradingDay);
-                self.schedule(
-                    entry
-                        .time_ms
-                        .checked_add(self.config.day_length_ms)
-                        .expect("sim time overflow"),
-                    SETTLE_SENTINEL,
-                );
-            } else {
-                self.wake_agent(entry.agent, entry.time_ms, entry.seq);
-            }
-        }
-        self.now_ms = self.now_ms.max(target_ms);
+        engine::run_until(self, target_ms);
     }
 
-    fn schedule(&mut self, time_ms: SimTime, agent: usize) {
-        let seq = self.next_seq;
-        self.next_seq = self.next_seq.checked_add(1).expect("sequence overflow");
-        self.queue.push(Reverse(QueueEntry {
-            time_ms,
-            seq,
-            agent,
-        }));
-    }
-
-    fn log_event(&mut self, time_ms: SimTime, seq: u64, kind: EventKind) {
-        self.replay_log.push(Event {
-            key: EventKey {
-                sim_time: time_ms,
-                source_priority: 1,
-                source_seq: seq,
-            },
-            kind,
-        });
-    }
-
-    fn wake_agent(&mut self, agent: usize, now_ms: SimTime, seq: u64) {
+    fn wake_agent(&mut self, agent: usize, now_ms: SimTime) {
         // Drop ids that have since filled or been cancelled.
         let mut live = std::mem::take(&mut self.agents[agent].resting);
-        live.retain(|id| self.exchange.book().order(*id).is_some());
+        live.retain(|id| self.core.exchange.book().order(*id).is_some());
 
-        let should_cancel =
-            !live.is_empty() && self.rng.bernoulli(self.config.params.cancel_probability);
+        let should_cancel = !live.is_empty()
+            && self
+                .core
+                .rng
+                .bernoulli(self.config.params.cancel_probability);
         if should_cancel {
-            let index = self.rng.uniform_int(0, live.len() as i64 - 1) as usize;
+            let index = self.core.rng.uniform_int(0, live.len() as i64 - 1) as usize;
             let order_id = live.swap_remove(index);
             self.agents[agent].resting = live;
-            let _ = self.exchange.cancel_order(agent as AccountId, order_id);
-            self.log_event(
-                now_ms,
-                seq,
-                EventKind::Cancel {
-                    account_id: agent as AccountId,
-                    order_id,
-                },
-            );
+            self.core
+                .cancel_tracked(agent as AccountId, order_id, now_ms);
         } else {
-            if let Some(order_id) = self.place_order(agent, now_ms, seq) {
+            if let Some(order_id) = self.place_order(agent, now_ms) {
                 live.push(order_id);
             }
             self.agents[agent].resting = live;
         }
 
         let gap = self
+            .core
             .rng
             .poisson_gap_ms(self.config.params.wake_rate_per_second);
-        self.schedule(now_ms.checked_add(gap).expect("sim time overflow"), agent);
+        let next = now_ms.checked_add(gap).expect("sim time overflow");
+        self.core.schedule(next, KIND_NOISE, agent);
     }
 
     /// Places one order; returns the order id when any quantity rests.
-    fn place_order(&mut self, agent: usize, now_ms: SimTime, seq: u64) -> Option<OrderId> {
-        let side = if self.rng.bernoulli(0.5) {
+    fn place_order(&mut self, agent: usize, now_ms: SimTime) -> Option<OrderId> {
+        let side = if self.core.rng.bernoulli(0.5) {
             Side::Buy
         } else {
             Side::Sell
         };
         let aggressive = self
+            .core
             .rng
             .bernoulli(self.config.params.aggressive_probability);
         let price = self.draw_price(side, aggressive);
@@ -388,47 +321,47 @@ impl NoiseMarket {
             limit_price: price,
             quantity,
         };
-        self.log_event(now_ms, seq, EventKind::Submit(request));
-        let Ok(result) = self.exchange.submit_limit_order(request) else {
-            self.rejected_submits += 1;
-            return None;
-        };
-        for trade in &result.trades {
-            self.last_trade_price = Some(trade.price);
-            self.tape
-                .push(TapePrint::new(now_ms, trade.price, trade.quantity));
-        }
-        if !result.trades.is_empty()
-            && let (Some(bid), Some(ask)) = (
-                self.exchange.book().best_bid(),
-                self.exchange.book().best_ask(),
-            )
-        {
-            self.spread_samples_ticks.push(ask - bid);
-        }
-        (result.remaining > 0).then_some(result.order_id)
+        self.core.submit_and_track(request, now_ms)
     }
 
     /// Touch-anchored pricing; see [`noise_order_price`].
     fn draw_price(&mut self, side: Side, aggressive: bool) -> Price {
         let view = QuoteView {
-            best_bid: self.exchange.book().best_bid(),
-            best_ask: self.exchange.book().best_ask(),
-            last_trade: self.last_trade_price,
+            best_bid: self.core.exchange.book().best_bid(),
+            best_ask: self.core.exchange.book().best_ask(),
+            last_trade: self.core.last_trade_price(),
             ref_price: self.config.ref_price,
         };
-        noise_order_price(view, &mut self.rng, &self.config.params, side, aggressive)
+        noise_order_price(
+            view,
+            &mut self.core.rng,
+            &self.config.params,
+            side,
+            aggressive,
+        )
     }
 
     /// Lognormal lot size; see [`noise_order_quantity`].
     fn draw_quantity(&mut self) -> Quantity {
-        noise_order_quantity(&mut self.rng, &self.config.params)
+        noise_order_quantity(&mut self.core.rng, &self.config.params)
+    }
+}
+
+impl MarketDriver for NoiseMarket {
+    fn core(&mut self) -> &mut MarketCore {
+        &mut self.core
+    }
+
+    fn wake(&mut self, kind: u8, index: usize, now_ms: SimTime) {
+        debug_assert_eq!(kind, KIND_NOISE, "the M1 market only has noise agents");
+        self.wake_agent(index, now_ms);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Account, AccountId, Exchange};
 
     fn small_config(seed: u64) -> NoiseMarketConfig {
         NoiseMarketConfig {

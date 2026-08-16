@@ -59,10 +59,12 @@ impl Session {
         }
     }
 
+    #[allow(dead_code)] // used by tests and future session introspection
     pub fn speed(&self) -> f64 {
         self.speed
     }
 
+    #[allow(dead_code)] // used by tests and future session introspection
     pub fn now_ms(&self) -> SimTime {
         self.market.now_ms()
     }
@@ -81,11 +83,9 @@ impl Session {
     /// Applies one client message; order/cancel requests produce an ack.
     pub fn apply(&mut self, msg: ClientMsg, seq: u64) -> Option<ServerMsg> {
         match msg {
-            ClientMsg::Order {
-                side,
-                price,
-                lots,
-            } => Some(self.order(side.into(), price, lots, seq)),
+            ClientMsg::Order { side, price, lots } => {
+                Some(self.order(side.into(), price, lots, seq))
+            }
             ClientMsg::Cancel { order_id } => Some(self.cancel(order_id, seq)),
             ClientMsg::Speed { multiplier } => {
                 self.speed = multiplier.clamp(0.0, 100.0);
@@ -198,8 +198,18 @@ impl Session {
             mark: view.mark,
             last_trade: view.last_trade,
             limit: view.price_limits,
-            bids: view.depth_bids.into_iter().map(LevelDto::from).collect(),
-            asks: view.depth_asks.into_iter().map(LevelDto::from).collect(),
+            bids: view
+                .depth_bids
+                .iter()
+                .copied()
+                .map(LevelDto::from)
+                .collect(),
+            asks: view
+                .depth_asks
+                .iter()
+                .copied()
+                .map(LevelDto::from)
+                .collect(),
             bars,
             tape,
             manip_phase: ManipTag::from(view.manip_phase),
@@ -252,7 +262,8 @@ mod tests {
     #[test]
     fn warm_start_opens_on_a_live_market() {
         let session = session();
-        let snapshot = unwrap_snapshot(&session.snapshot());
+        let hello = session.snapshot();
+        let snapshot = unwrap_snapshot(&hello);
         assert!(session.now_ms() >= 120_000);
         assert!(snapshot.best_bid.is_some() && snapshot.best_ask.is_some());
         assert!(!snapshot.bars.is_empty(), "candles exist from tick one");
@@ -264,10 +275,7 @@ mod tests {
     fn advance_moves_the_clock_at_the_configured_speed() {
         let mut session = session();
         let start = session.now_ms();
-        session.apply(
-            ClientMsg::Speed { multiplier: 5.0 },
-            0,
-        );
+        session.apply(ClientMsg::Speed { multiplier: 5.0 }, 0);
         session.advance(); // 100ms real * 5x = 500ms sim
         assert_eq!(session.now_ms() - start, 500);
     }
@@ -296,17 +304,20 @@ mod tests {
     #[test]
     fn orders_acknowledge_fills_and_rejections() {
         let mut session = session();
-        let snapshot = unwrap_snapshot(&session.snapshot());
+        let hello = session.snapshot();
+        let snapshot = unwrap_snapshot(&hello);
         let ask = snapshot.best_ask.unwrap();
 
-        let ack = session.apply(
-            ClientMsg::Order {
-                side: SideTag::Buy,
-                price: ask,
-                lots: 1,
-            },
-            1,
-        );
+        let ack = session
+            .apply(
+                ClientMsg::Order {
+                    side: SideTag::Buy,
+                    price: ask,
+                    lots: 1,
+                },
+                1,
+            )
+            .expect("orders always ack");
         match ack {
             ServerMsg::Ack(Ack {
                 seq,
@@ -323,40 +334,38 @@ mod tests {
         }
 
         // An out-of-band price is rejected with the band in the reason.
-        let (lower, upper) = snapshot.limit.unwrap();
-        let ack = session.apply(
-            ClientMsg::Order {
-                side: SideTag::Buy,
-                price: upper + 1,
-                lots: 1,
-            },
-            2,
-        );
+        let (_lower, upper) = snapshot.limit.unwrap();
+        let ack = session
+            .apply(
+                ClientMsg::Order {
+                    side: SideTag::Buy,
+                    price: upper + 1,
+                    lots: 1,
+                },
+                2,
+            )
+            .expect("orders always ack");
         match ack {
-            ServerMsg::Ack(Ack {
-                seq,
-                ok,
-                error,
-                ..
-            }) => {
+            ServerMsg::Ack(Ack { seq, ok, error, .. }) => {
                 assert_eq!(seq, 2);
                 assert!(!ok);
                 let reason = error.unwrap();
                 assert!(reason.contains("PriceOutsideLimits"), "{reason}");
-                let _ = lower;
             }
             other => panic!("expected an ack, got {other:?}"),
         }
 
         // Non-positive size is rejected without touching the market.
-        let ack = session.apply(
-            ClientMsg::Order {
-                side: SideTag::Sell,
-                price: ask,
-                lots: 0,
-            },
-            3,
-        );
+        let ack = session
+            .apply(
+                ClientMsg::Order {
+                    side: SideTag::Sell,
+                    price: ask,
+                    lots: 0,
+                },
+                3,
+            )
+            .expect("orders always ack");
         match ack {
             ServerMsg::Ack(Ack { ok, error, .. }) => {
                 assert!(!ok);
@@ -369,30 +378,35 @@ mod tests {
     #[test]
     fn resting_orders_can_be_cancelled_through_the_protocol() {
         let mut session = session();
-        let snapshot = unwrap_snapshot(&session.snapshot());
+        let hello = session.snapshot();
+        let snapshot = unwrap_snapshot(&hello);
         let price = snapshot.best_bid.unwrap();
 
-        let order_id = match session.apply(
-            ClientMsg::Order {
-                side: SideTag::Buy,
-                price,
-                lots: 1,
-            },
-            1,
-        ) {
+        let order_id = match session
+            .apply(
+                ClientMsg::Order {
+                    side: SideTag::Buy,
+                    price,
+                    lots: 1,
+                },
+                1,
+            )
+            .expect("orders always ack")
+        {
             ServerMsg::Ack(Ack {
-                order_id: Some(id),
-                ..
+                order_id: Some(id), ..
             }) => id,
             other => panic!("expected a resting order, got {other:?}"),
         };
 
-        let snapshot = unwrap_snapshot(&session.snapshot());
+        let after_order = session.snapshot();
+        let snapshot = unwrap_snapshot(&after_order);
         assert_eq!(snapshot.player.open_orders.len(), 1);
         assert_eq!(snapshot.player.open_orders[0].order_id, order_id);
 
         session.apply(ClientMsg::Cancel { order_id }, 2);
-        let snapshot = unwrap_snapshot(&session.snapshot());
+        let after_cancel = session.snapshot();
+        let snapshot = unwrap_snapshot(&after_cancel);
         assert!(snapshot.player.open_orders.is_empty());
     }
 

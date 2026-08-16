@@ -225,7 +225,10 @@ mod tests {
                     lots: 1,
                 },
             ),
-            (r#"{"type":"cancel","order_id":7}"#, ClientMsg::Cancel { order_id: 7 }),
+            (
+                r#"{"type":"cancel","order_id":7}"#,
+                ClientMsg::Cancel { order_id: 7 },
+            ),
             (
                 r#"{"type":"speed","multiplier":0}"#,
                 ClientMsg::Speed { multiplier: 0.0 },

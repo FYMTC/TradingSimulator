@@ -17,11 +17,11 @@ mod session;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use axum::Router;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{ConnectInfo, Query, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::get;
-use axum::Router;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tower_http::services::ServeDir;
@@ -51,22 +51,16 @@ async fn main() {
         .route("/ws", get(ws_handler))
         .fallback_service(ServeDir::new(static_dir));
 
-    let listener = TcpListener_bind(port).await;
-    eprintln!(
-        "gateway listening on http://127.0.0.1:{port}, static assets from frontend/dist"
-    );
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .expect("bind gateway port");
+    eprintln!("gateway listening on http://127.0.0.1:{port}, static assets from frontend/dist");
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .await
     .expect("gateway server error");
-}
-
-async fn TcpListener_bind(port: u16) -> tokio::net::TcpListener {
-    tokio::net::TcpListener::bind(("127.0.0.1", port))
-        .await
-        .expect("bind gateway port")
 }
 
 async fn ws_handler(
