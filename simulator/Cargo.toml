@@ -1,0 +1,13 @@
+[package]
+name = "trading-simulator"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+description = "Deterministic single-instrument matching core for TradingSimulator M0"
+license = "MIT"
+
+[lib]
+name = "trading_simulator"
+path = "src/lib.rs"
+
+[dependencies]

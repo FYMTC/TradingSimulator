@@ -1,0 +1,22 @@
+[package]
+name = "gateway"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "WebSocket gateway and static-asset host for the TradingSimulator game"
+
+[[bin]]
+name = "gateway"
+path = "src/main.rs"
+
+[dependencies]
+trading-simulator.workspace = true
+tokio.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures-util = "0.3"
+tower-http = { version = "0.6", features = ["fs"] }
+
+[dev-dependencies]
